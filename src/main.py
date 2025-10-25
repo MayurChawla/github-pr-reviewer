@@ -9,6 +9,7 @@ import base64
 from dotenv import load_dotenv
 from datetime import datetime
 import google.generativeai as genai
+import google.api_core.exceptions
 
 load_dotenv()
 
@@ -20,13 +21,25 @@ app = FastAPI(
 
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-
-import google.generativeai as genai
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    print(f"🔮 Gemini AI configured: {bool(GEMINI_API_KEY)}")
+    try:
+        genai.configure(
+            api_key=GEMINI_API_KEY,
+            transport='rest',
+        )
+        print(f"🔮 Gemini AI configured successfully!")
+        
+        # try:
+        #     models = genai.list_models()
+        #     available_models = [model.name for model in models]
+        #     print(f"📋 Available Gemini models: {available_models}")
+        # except Exception as e:
+        #     print(f"⚠️  Could not list models: {e}")
+            
+    except Exception as e:
+        print(f"❌ Gemini configuration failed: {e}")
 else:
     print("⚠️  Gemini API key not found - AI analysis will be disabled")
 
@@ -42,33 +55,23 @@ class GitHubAPI:
         self.base_url = "https://api.github.com"
     
     def get_file_content(self, repo: str, file_path: str, ref: str = "main"):
-        """Get file content from GitHub at specific commit"""
         url = f"{self.base_url}/repos/{repo}/contents/{file_path}?ref={ref}"
         try:
-            print(f"   🔍 Making GitHub API request to: {url}")
             response = requests.get(url, headers=self.headers)
-            print(f"   📡 Response status: {response.status_code}")
             
             if response.status_code == 200:
-                data = response.json()
-                return data
+                return response.json()
             elif response.status_code == 404:
-                print(f"   ⚠️  File not found: {file_path} at ref {ref}")
                 return None
             elif response.status_code == 403:
-                print(f"   🔐 Rate limit or permission issue: {response.text}")
                 return None
             else:
-                print(f"   ❌ GitHub API Error: {response.status_code}")
                 return None
         except Exception as e:
-            print(f"   ❌ GitHub API Exception: {e}")
             return None
 
-# Initialize GitHub API
 github_api = GitHubAPI(GITHUB_TOKEN)
 
-# ===== CORE ENDPOINTS =====
 @app.get("/")
 async def root():
     return {"message": "GitHub AI Agent is running!", "status": "healthy"}
@@ -77,66 +80,7 @@ async def root():
 async def health_check():
     return {"status": "healthy", "service": "github-ai-agent"}
 
-@app.get("/debug-env")
-async def debug_env():
-    """Check environment variables"""
-    print("🔍 Debug env endpoint called")
-    return {
-        "webhook_secret_set": bool(WEBHOOK_SECRET),
-        "webhook_secret_preview": WEBHOOK_SECRET[:10] + "..." if WEBHOOK_SECRET else "None",
-        "github_token_set": bool(GITHUB_TOKEN),
-        "github_token_preview": GITHUB_TOKEN[:10] + "..." if GITHUB_TOKEN else "None",
-        "github_token_length": len(GITHUB_TOKEN) if GITHUB_TOKEN else 0,
-        "message": "Environment variables loaded successfully!"
-    }
-
-@app.get("/debug-token")
-async def debug_token():
-    """Debug endpoint to check GitHub token"""
-    print("🔐 Debug token endpoint called")
-    if not GITHUB_TOKEN:
-        return {"error": "No GitHub token configured"}
-    
-    # Test the token by making a simple API call
-    url = "https://api.github.com/user"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    
-    try:
-        response = requests.get(url, headers=headers)
-        print(f"🔐 GitHub API response status: {response.status_code}")
-        if response.status_code == 200:
-            user_data = response.json()
-            return {
-                "token_valid": True,
-                "user": user_data.get("login"),
-                "rate_limit_remaining": response.headers.get("X-RateLimit-Remaining"),
-                "message": "Token is valid!"
-            }
-        else:
-            return {
-                "token_valid": False,
-                "status_code": response.status_code,
-                "error": response.text
-            }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/routes")
-async def list_routes():
-    """List all available routes"""
-    routes = []
-    for route in app.routes:
-        route_info = {
-            "path": getattr(route, "path", None),
-            "methods": getattr(route, "methods", None),
-            "name": getattr(route, "name", None)
-        }
-        routes.append(route_info)
-    return {"available_routes": routes}
-
-# ===== WEBHOOK FUNCTIONALITY =====
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
-    """Verify GitHub webhook signature"""
     if not WEBHOOK_SECRET or not signature:
         return True
     
@@ -154,25 +98,26 @@ async def github_webhook(
     x_hub_signature_256: str = Header(None),
     x_github_event: str = Header(None)
 ):
-    """
-    Receive GitHub webhooks
-    """
     try:
-        # Get raw payload
         payload = await request.body()
         payload_str = payload.decode('utf-8')
         
-        # Verify webhook signature
         if WEBHOOK_SECRET and x_hub_signature_256:
             if not verify_webhook_signature(payload, x_hub_signature_256):
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
         
-        # Parse JSON payload
         json_payload = json.loads(payload_str)
         
         print(f"📨 Received GitHub event: {x_github_event}")
         
-        # Handle different GitHub events
+        sender = json_payload.get("sender", {})
+        if sender.get("type") == "Bot" or "bot" in sender.get("login", "").lower():
+            print("🤖 Ignoring bot-generated push event")
+            return JSONResponse(
+                status_code=200,
+                content={"message": "Bot event ignored to prevent loops"}
+            )
+        
         if x_github_event == "push":
             return await handle_push_event(json_payload)
         elif x_github_event == "pull_request":
@@ -188,51 +133,68 @@ async def github_webhook(
         raise HTTPException(status_code=500, detail=str(e))
 
 async def handle_push_event(payload: dict):
-    """Handle GitHub push events with ACTUAL file content analysis"""
     repo_name = payload["repository"]["full_name"]
     commits = payload.get("commits", [])
-    before_commit = payload.get("before")
-    after_commit = payload.get("after")
     
     print(f"🚀 Push event for {repo_name}")
     print(f"📊 Commits: {len(commits)}")
     
-    # Extract ALL changed files from all commits
     all_changed_files = set()
     for commit in commits:
         all_changed_files.update(commit.get("added", []))
         all_changed_files.update(commit.get("modified", []))
         all_changed_files.update(commit.get("removed", []))
     
-    changed_files = list(all_changed_files)
-    print(f"📄 Changed files: {changed_files}")
+    changed_files = [f for f in list(all_changed_files) if f.lower() != 'readme.md']
     
-    # Get ACTUAL file changes and content
+    print(f"📄 Changed files (excluding README.md): {changed_files}")
+    
+    if not changed_files:
+        print("📝 Only README.md changed or no files changed - skipping analysis")
+        return {
+            "status": "skipped",
+            "event": "push", 
+            "repo": repo_name,
+            "reason": "Only README.md changed or no files changed",
+            "commit_count": len(commits)
+        }
+    
     file_changes_analysis = await analyze_file_changes(repo_name, commits, changed_files)
     
-    # Get AI analysis if Gemini is configured
     ai_analysis_result = {}
-    if commits and GEMINI_API_KEY:
+    if commits and GEMINI_API_KEY and file_changes_analysis:
         commit_message = commits[-1].get("message", "No commit message")
         ai_analysis_result = await analyze_changes_with_gemini(
             file_changes_analysis, 
             repo_name, 
             commit_message
         )
+        
+        if (ai_analysis_result.get("ai_analysis") and 
+            not ai_analysis_result.get("ai_analysis", "").startswith("Analysis failed") and
+            not ai_analysis_result.get("ai_analysis", "").startswith("Gemini not configured")):
+            
+            current_commit_sha = commits[-1]["id"]
+            await update_readme_with_analysis(
+                repo_name, 
+                ai_analysis_result["ai_analysis"], 
+                current_commit_sha,
+                GITHUB_TOKEN
+            )
     else:
-        ai_analysis_result = {"ai_analysis": "Gemini not configured or no commits"}
+        ai_analysis_result = {"ai_analysis": "No analysis performed"}
     
     return {
         "status": "processed",
         "event": "push",
         "repo": repo_name,
         "commit_count": len(commits),
+        "files_analyzed": changed_files,
         "file_changes": file_changes_analysis,
         "ai_analysis": ai_analysis_result
     }
 
 async def handle_pull_request_event(payload: dict):
-    """Handle GitHub pull request events"""
     pr_action = payload.get("action")
     pr_number = payload["pull_request"]["number"]
     repo_name = payload["repository"]["full_name"]
@@ -248,7 +210,6 @@ async def handle_pull_request_event(payload: dict):
     }
 
 async def analyze_file_changes(repo_name: str, commits: list, changed_files: list) -> list:
-    """Get ACTUAL file content and changes"""
     print(f"🔍 Getting actual content for {len(changed_files)} changed files...")
     
     file_analysis = []
@@ -269,13 +230,11 @@ async def analyze_file_changes(repo_name: str, commits: list, changed_files: lis
         }
         
         if commits:
-            current_commit_sha = commits[-1]["id"]  # The new commit
+            current_commit_sha = commits[-1]["id"]
             parent_commit_sha = commits[0].get("parents", [{}])[0].get("sha") if commits[0].get("parents") else None
             
             print(f"   🔄 Current commit: {current_commit_sha[:8]}")
-            print(f"   🔄 Parent commit: {parent_commit_sha[:8] if parent_commit_sha else 'None (likely initial commit)'}")
-            
-            before_commit_sha = commits[0].get("id")  # This might be wrong approach
+            print(f"   🔄 Parent commit: {parent_commit_sha[:8] if parent_commit_sha else 'None'}")
             
             if len(commits) > 0:
                 first_commit_sha = commits[0]["id"]
@@ -290,11 +249,10 @@ async def analyze_file_changes(repo_name: str, commits: list, changed_files: lis
                         file_info["before_lines"] = before_content["lines"]
                         print(f"   ✅ BEFORE content: {file_info['before_size']} chars, {file_info['before_lines']} lines")
                     else:
-                        print(f"   ⚠️  No BEFORE content found - file might be newly added")
+                        print(f"   ⚠️  No BEFORE content found")
                 else:
-                    print(f"   ⚠️  No parent commit - this might be the initial commit")
+                    print(f"   ⚠️  No parent commit")
             
-            # Get AFTER content (current state)
             print(f"   🔍 Getting AFTER content from current: {current_commit_sha[:8]}")
             after_content = await get_file_content_at_commit(repo_name, file_path, current_commit_sha)
             if after_content:
@@ -303,33 +261,30 @@ async def analyze_file_changes(repo_name: str, commits: list, changed_files: lis
                 file_info["after_lines"] = after_content["lines"]
                 print(f"   ✅ AFTER content: {file_info['after_size']} chars, {file_info['after_lines']} lines")
             else:
-                print(f"   ⚠️  No AFTER content found - file might be deleted")
+                print(f"   ⚠️  No AFTER content found")
             
-            # Determine file status from commit data
             for commit in commits:
                 if file_path in commit.get("added", []):
                     file_info["status"] = "added"
-                    print(f"   📝 Status: ADDED (from commit data)")
+                    print(f"   📝 Status: ADDED")
                     break
                 elif file_path in commit.get("removed", []):
                     file_info["status"] = "removed" 
-                    print(f"   📝 Status: REMOVED (from commit data)")
+                    print(f"   📝 Status: REMOVED")
                     break
                 elif file_path in commit.get("modified", []):
                     file_info["status"] = "modified"
-                    print(f"   📝 Status: MODIFIED (from commit data)")
+                    print(f"   📝 Status: MODIFIED")
                     break
             
-            # If we couldn't determine from commit data, use content presence
             if file_info["status"] == "modified":
                 if not file_info["before_content"] and file_info["after_content"]:
                     file_info["status"] = "added"
-                    print(f"   📝 Status: ADDED (inferred from content)")
+                    print(f"   📝 Status: ADDED")
                 elif file_info["before_content"] and not file_info["after_content"]:
                     file_info["status"] = "removed"
-                    print(f"   📝 Status: REMOVED (inferred from content)")
+                    print(f"   📝 Status: REMOVED")
         
-        # Show content comparison
         print(f"   📊 FINAL CONTENT SUMMARY:")
         print(f"     - Status: {file_info['status']}")
         print(f"     - Before: {file_info['before_size']} chars, {file_info['before_lines']} lines")
@@ -338,11 +293,6 @@ async def analyze_file_changes(repo_name: str, commits: list, changed_files: lis
         if file_info["before_content"] and file_info["after_content"]:
             content_diff = len(file_info['after_content']) - len(file_info['before_content'])
             print(f"     - Size change: {content_diff:+d} chars")
-            
-            # Show preview of changes
-            if content_diff != 0:
-                print(f"     - Before preview: {file_info['before_content'][:100]}...")
-                print(f"     - After preview: {file_info['after_content'][:100]}...")
         
         file_analysis.append(file_info)
     
@@ -350,23 +300,14 @@ async def analyze_file_changes(repo_name: str, commits: list, changed_files: lis
     return file_analysis
 
 async def get_file_content_at_commit(repo_name: str, file_path: str, commit_sha: str) -> dict:
-    """Get file content at specific commit"""
-    if not GITHUB_TOKEN:
-        print(f"   ❌ GitHub token not available")
-        return None
-    
-    if not commit_sha:
-        print(f"   ❌ No commit SHA provided")
+    if not GITHUB_TOKEN or not commit_sha:
         return None
     
     try:
-        print(f"   🔍 Fetching content for '{file_path}' at commit {commit_sha[:8]}...")
         file_data = github_api.get_file_content(repo_name, file_path, commit_sha)
         
         if file_data and "content" in file_data:
-            # Decode base64 content
             content = base64.b64decode(file_data["content"]).decode('utf-8')
-            print(f"   ✅ Successfully fetched {len(content)} characters")
             
             return {
                 "content": content,
@@ -375,31 +316,16 @@ async def get_file_content_at_commit(repo_name: str, file_path: str, commit_sha:
                 "encoding": file_data.get("encoding", "base64"),
                 "sha": file_data.get("sha", "")
             }
-        else:
-            if file_data is None:
-                print(f"   ⚠️  File not found or no content (might be deleted)")
-            elif "message" in file_data:
-                print(f"   ❌ GitHub API error: {file_data['message']}")
-            else:
-                print(f"   ❌ Unknown error fetching content")
-            
-    except Exception as e:
-        print(f"   ❌ Exception fetching content: {str(e)}")
+    except Exception:
+        pass
     
     return None
 
 async def get_parent_commit(repo_name: str, commit_sha: str) -> str:
-    """Get the parent commit SHA for a given commit"""
     if not GITHUB_TOKEN:
-        print(f"   ❌ No GitHub token available")
-        return None
-    
-    if not commit_sha:
-        print(f"   ❌ No commit SHA provided")
         return None
     
     try:
-        print(f"   🔍 Fetching parent commit for {commit_sha[:8]}...")
         url = f"https://api.github.com/repos/{repo_name}/commits/{commit_sha}"
         headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
@@ -407,7 +333,6 @@ async def get_parent_commit(repo_name: str, commit_sha: str) -> str:
         }
         
         response = requests.get(url, headers=headers)
-        print(f"   📡 Parent commit API status: {response.status_code}")
         
         if response.status_code == 200:
             commit_data = response.json()
@@ -415,45 +340,21 @@ async def get_parent_commit(repo_name: str, commit_sha: str) -> str:
             
             if parents:
                 parent_sha = parents[0]["sha"]
-                print(f"   ✅ Found parent commit: {parent_sha[:8]}")
                 return parent_sha
-            else:
-                print(f"   ⚠️  No parent commits - this is likely the initial commit")
-                return None
-        else:
-            print(f"   ❌ Failed to get parent commit: {response.status_code} - {response.text[:200]}")
-            return None
-            
-    except Exception as e:
-        print(f"   ❌ Error getting parent commit: {str(e)}")
-        return None
-
-def determine_file_status(file_info: dict, commits: list, file_path: str) -> str:
-    """Determine the actual status of the file (added, modified, removed)"""
-    for commit in commits:
-        if file_path in commit.get("added", []):
-            return "added"
-        elif file_path in commit.get("removed", []):
-            return "removed"
+    except Exception:
+        pass
     
-    if file_info["before_content"] and not file_info["after_content"]:
-        return "removed"
-    elif not file_info["before_content"] and file_info["after_content"]:
-        return "added"
-    elif file_info["before_content"] and file_info["after_content"]:
-        return "modified"
-    
-    return "unknown"
+    return None
 
 async def analyze_changes_with_gemini(file_changes: list, repo_name: str, commit_message: str) -> dict:
-    """Use Gemini AI to analyze the code changes and provide insights"""
     if not GEMINI_API_KEY:
         print("🤖 Gemini API key not configured - skipping AI analysis")
         return {"ai_analysis": "Gemini not configured"}
     
     try:
-        # Prepare the context for Gemini
         changed_files_summary = []
+        content_samples = []
+        
         for file in file_changes:
             file_summary = {
                 "file": file["file_path"],
@@ -462,12 +363,8 @@ async def analyze_changes_with_gemini(file_changes: list, repo_name: str, commit
                 "size_change": f"+{file.get('after_size', 0) - file.get('before_size', 0)} chars"
             }
             changed_files_summary.append(file_summary)
-        
-        # Get actual content samples for analysis
-        content_samples = []
-        for file in file_changes:
+            
             if file["status"] == "modified" and file.get("before_content") and file.get("after_content"):
-                # Show a diff-like preview
                 before_preview = file["before_content"][:200] + "..." if len(file["before_content"]) > 200 else file["before_content"]
                 after_preview = file["after_content"][:200] + "..." if len(file["after_content"]) > 200 else file["after_content"]
                 
@@ -476,7 +373,13 @@ File: {file['file_path']}
 Before: {before_preview}
 After: {after_preview}
 """)
-        
+            elif file["status"] == "added" and file.get("after_content"):
+                content_preview = file["after_content"][:300] + "..." if len(file["after_content"]) > 300 else file["after_content"]
+                content_samples.append(f"""
+File: {file['file_path']} (NEWLY ADDED)
+Content: {content_preview}
+""")
+
         context = f"""
 Repository: {repo_name}
 Commit Message: {commit_message}
@@ -488,7 +391,6 @@ Content Changes:
 {''.join(content_samples) if content_samples else 'No content changes available'}
 """
         
-        # Create Gemini prompt
         prompt = f"""
 You are a senior software engineer reviewing GitHub code changes. Analyze these changes and provide:
 
@@ -508,26 +410,110 @@ Please provide your analysis in a structured but concise format.
         
         print("🤖 Sending changes to Gemini for analysis...")
         
-        # Initialize the Gemini model
-        model = genai.GenerativeModel('gemini-pro')
+        model_names_to_try = [
+            'models/gemini-2.0-flash',
+            'models/gemini-pro-latest',
+            'models/gemini-2.0-flash-001',
+        ]
         
-        response = model.generate_content(prompt)
+        response = None
+        last_error = None
+        
+        for model_name in model_names_to_try:
+            try:
+                print(f"   🔧 Trying model: {model_name}")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                print(f"   ✅ Success with model: {model_name}")
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        
+        if response is None:
+            print(f"❌ All model attempts failed. Last error: {last_error}")
+            return {"ai_analysis": f"Gemini analysis failed: {str(last_error)}"}
         
         ai_analysis = response.text
         
         print("✅ Gemini analysis completed!")
+        print(f"📝 Analysis preview: {ai_analysis[:200]}...")
         
         return {
             "ai_analysis": ai_analysis,
-            "model_used": "gemini-pro",
+            "model_used": model_name,
             "analysis_timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
         print(f"❌ Gemini analysis error: {str(e)}")
         return {"ai_analysis": f"Analysis failed: {str(e)}"}
-    
 
+async def update_readme_with_analysis(repo_name: str, analysis: str, commit_sha: str, github_token: str):
+    try:
+        print(f"📝 Updating README.md with analysis for commit {commit_sha[:8]}...")
+        
+        headers = {
+            "Authorization": f"token {github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        readme_url = f"https://api.github.com/repos/{repo_name}/contents/README.md"
+        response = requests.get(readme_url, headers=headers)
+        
+        if response.status_code != 200:
+            print(f"❌ Could not fetch README: {response.status_code}")
+            return False
+        
+        readme_data = response.json()
+        current_content = base64.b64decode(readme_data["content"]).decode('utf-8')
+        readme_sha = readme_data["sha"]
+        
+        analysis_section = f"""
+## 🤖 AI Code Analysis
+
+**Last Analysis:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+**Commit:** `{commit_sha[:8]}`
+
+### Analysis Report:
+{analysis}
+
+---
+*Generated by GitHub AI Agent*
+"""
+        
+        if "## 🤖 AI Code Analysis" in current_content:
+            parts = current_content.split("## 🤖 AI Code Analysis")
+            if len(parts) > 1:
+                remaining = parts[1].split("---\n*Generated by GitHub AI Agent*")
+                if len(remaining) > 1:
+                    new_content = parts[0] + analysis_section + remaining[1]
+                else:
+                    new_content = parts[0] + analysis_section
+            else:
+                new_content = current_content + "\n" + analysis_section
+        else:
+            new_content = current_content + "\n" + analysis_section
+        
+        update_data = {
+            "message": f"🤖 AI Analysis Update for {commit_sha[:8]}",
+            "content": base64.b64encode(new_content.encode()).decode(),
+            "sha": readme_sha,
+            "branch": "main"
+        }
+        
+        update_response = requests.put(readme_url, headers=headers, json=update_data)
+        
+        if update_response.status_code == 200:
+            print("✅ README.md updated successfully with AI analysis!")
+            return True
+        else:
+            print(f"❌ Failed to update README: {update_response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error updating README: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     import uvicorn
@@ -535,4 +521,5 @@ if __name__ == "__main__":
     print(f"🔧 GITHUB_TOKEN configured: {bool(GITHUB_TOKEN)}")
     print(f"🔧 WEBHOOK_SECRET configured: {bool(WEBHOOK_SECRET)}")
     uvicorn.run(app, host="localhost", port=8000, log_level="info")
+
 
